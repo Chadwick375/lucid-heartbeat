@@ -1,0 +1,94 @@
+name: Lucid engine watchdog
+# EXTERNAL dead-man's switch. Checks the engine liveness pulse every 30 min from
+# GitHub's cloud. If the engine hasn't ticked in >1h (all pingers down) or the
+# site is unreachable, the run FAILS -> GitHub emails the repo owner (works with
+# no creds, independent of Hostinger), and a richer SMTP email is sent best-effort.
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+    inputs:
+      force_alert:
+        description: send a TEST alert email and exit
+        type: boolean
+        default: false
+permissions:
+  contents: write
+concurrency:
+  group: watchdog
+  cancel-in-progress: false
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check engine liveness + alert
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          ALERT_TO:  ${{ secrets.ALERT_TO }}
+          FORCE: ${{ github.event.inputs.force_alert }}
+        run: |
+          set -uo pipefail
+          URL="https://lucidai.pro/learn/api/engine_status.php"
+          RESP=$(curl -sS -m 30 -w '\n%{http_code}' "$URL" || printf '\n000')
+          CODE=$(printf '%s' "$RESP" | tail -n1)
+          JSON=$(printf '%s' "$RESP" | sed '$d')
+          STATUS=ok; REASON=""
+          if [ "$CODE" != "200" ]; then
+            STATUS=down; REASON="engine_status endpoint unreachable (HTTP $CODE) — the site/server may be DOWN"
+          else
+            AGE=$(printf '%s' "$JSON" | grep -oE '"last_tick_age_sec":[0-9]+' | grep -oE '[0-9]+$' || printf '999999')
+            if [ "${AGE:-999999}" -gt 3600 ]; then
+              STATUS=down; REASON="engine has not ticked in ${AGE}s (> 1 hour) — all pingers appear DOWN"
+            fi
+          fi
+          echo "engine=$STATUS http=$CODE $REASON"; echo "$JSON"
+          export SUBJ="" BODY=""
+          send_email () {
+            export SUBJ="$1"; export BODY="$2"
+            python3 - <<'PY'
+import os,sys,smtplib,ssl
+from email.mime.text import MIMEText
+host=os.environ.get('SMTP_HOST'); user=os.environ.get('SMTP_USER')
+pwd=os.environ.get('SMTP_PASS'); to=os.environ.get('ALERT_TO')
+port=int(os.environ.get('SMTP_PORT') or 465)
+if not (host and user and pwd and to):
+    print('  [email] SMTP secrets incomplete; skipping (GitHub failure notice still fires)'); sys.exit(0)
+try:
+    m=MIMEText(os.environ['BODY'],'html','utf-8'); m['Subject']=os.environ['SUBJ']; m['From']=user; m['To']=to
+    s=smtplib.SMTP_SSL(host,port,context=ssl.create_default_context(),timeout=30) if port==465 else smtplib.SMTP(host,port,timeout=30)
+    if port!=465: s.starttls(context=ssl.create_default_context())
+    s.login(user,pwd); s.sendmail(user,[to],m.as_string()); s.quit(); print('  [email] sent to',to)
+except Exception as e:
+    print('  [email] failed:',str(e)[:140])
+PY
+          }
+          PREV=$(cat .watchdog-state 2>/dev/null || echo ok)
+          if [ "${FORCE:-false}" = "true" ]; then
+            send_email "Lucid watchdog — TEST alert" "<p>Test of the external dead-man's switch. If you received this, the alert email path works.</p><p>Live engine status: <code>${JSON}</code></p>"
+            echo "::notice::test alert sent"; exit 0
+          fi
+          commit_state () {
+            echo "$1" > .watchdog-state
+            git config user.name lucid-bot
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add .watchdog-state && git commit -m "watchdog: $2" >/dev/null 2>&1 && git push || true
+          }
+          if [ "$STATUS" = "down" ]; then
+            if [ "$PREV" != "down" ]; then
+              send_email "ALERT: Lucid engine DOWN" "<p>The Lucid Academy autonomous engine appears <b>DOWN</b>.</p><p>${REASON}</p><p>All independent triggers (GitHub pinger / laptop tasks / Hostinger cron) may have failed, or the site is unreachable. The platform may not be running.</p>"
+              commit_state down "ok -> down"
+            fi
+            echo "::error::Lucid engine DOWN — ${REASON}"
+            exit 1
+          else
+            if [ "$PREV" = "down" ]; then
+              send_email "Recovered: Lucid engine is ticking again" "<p>The engine is healthy again.</p><p>Live status: <code>${JSON}</code></p>"
+              commit_state ok "down -> ok"
+            fi
+            echo "engine healthy (age ok)"
+          fi
